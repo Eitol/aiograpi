@@ -3,6 +3,8 @@ import json
 import os.path
 import random
 import logging
+import threading
+
 import requests
 import unittest
 from datetime import datetime, timedelta
@@ -96,6 +98,8 @@ def keep_path(user):
 
 
 class BaseClientMixin:
+    cl: Client
+
     def __init__(self, *args, **kwargs):
         if self.cl is None:
             self.cl = Client()
@@ -110,24 +114,25 @@ class BaseClientMixin:
 
 
 class ClientPrivateTestCase(BaseClientMixin, unittest.TestCase):
-    cl = None
+    cl: Client = None
     _username_cache = {}
+    _login_finished = False
+    _sem = threading.Semaphore()
 
-    def user_info_by_username(self, username):
+    async def user_info_by_username(self, username):
+        await self._assert_init()
         return await self.cl.user_info_by_username_v1(username)
 
-    def user_id_from_username(self, username):
+    async def user_id_from_username(self, username):
+        await self._assert_init()
         info = self._username_cache.get(username)
         if not info:
             info = self.user_info_by_username(username)
             self._username_cache[username] = info
         return str(info.pk)
 
-    def setup_method(self, *args, **kwargs):
-        if TEST_ACCOUNTS_URL:
-            self.cl = self.fresh_account()
-
-    def fresh_account(self):
+    async def fresh_account(self):
+        await self._assert_init()
         acc = requests.get(TEST_ACCOUNTS_URL).json()[0]
         print("New fresh account %(username)r" % acc)
         settings = acc["client_settings"]
@@ -135,7 +140,7 @@ class ClientPrivateTestCase(BaseClientMixin, unittest.TestCase):
         cl = Client(settings=settings, proxy=acc["proxy"])
         if totp_seed:
             totp_code = await cl.totp_generate_code(totp_seed)
-            cl.login(
+            await cl.login(
                 acc["username"],
                 acc["password"],
                 verification_code=totp_code,
@@ -147,16 +152,25 @@ class ClientPrivateTestCase(BaseClientMixin, unittest.TestCase):
         return cl
 
     def __init__(self, *args, **kwargs):
+        self._assert_init()
+        super().__init__(*args, **kwargs)
+
+    async def _assert_init(self):
+        self._sem.acquire()
+        if self._login_finished:
+            self._sem.release()
+            return
         if TEST_ACCOUNTS_URL:
-            self.cl = self.fresh_account()
-            return super().__init__(*args, **kwargs)
-        filename = f"/tmp/aiograpi_tests_client_settings_{ACCOUNT_USERNAME}.json"
+            self.cl = await self.fresh_account()
+            self._sem.release()
+            return
+        filename = Path(f"/tmp/aiograpi_tests_client_settings_{ACCOUNT_USERNAME}.json")
         self.cl = Client()
         settings = {}
         try:
             st = os.stat(filename)
             if datetime.fromtimestamp(st.st_mtime) > (
-                datetime.now() - timedelta(seconds=3600)
+                    datetime.now() - timedelta(seconds=3600)
             ):
                 # use only fresh session (5 minutes)
                 settings = self.cl.load_settings(filename)
@@ -177,7 +191,8 @@ class ClientPrivateTestCase(BaseClientMixin, unittest.TestCase):
         else:
             await self.cl.login(ACCOUNT_USERNAME, ACCOUNT_PASSWORD, relogin=True)
         self.cl.dump_settings(filename)
-        super().__init__(*args, **kwargs)
+        self._login_finished = True
+        self._sem.release()
 
 
 class ClientPublicTestCase(BaseClientMixin, unittest.TestCase):
@@ -192,7 +207,7 @@ class ClientPublicTestCase(BaseClientMixin, unittest.TestCase):
             else:
                 self.assertEqual(obj[key], value)
 
-    def test_media_info_gql(self):
+    async def test_media_info_gql(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/BVDOOolFFxg/"
         )
@@ -233,7 +248,7 @@ class ClientTestCase(unittest.TestCase):
         phone_id = "57d64c41-a916-3fa5-bd7a-3796c1dab122"
         self.assertTrue(generate_jazoest(phone_id), "22413")
 
-    def test_lg(self):
+    async def test_lg(self):
         settings = {
             "uuids": {
                 "phone_id": "57d64c41-a916-3fa5-bd7a-3796c1dab122",
@@ -330,12 +345,12 @@ class ClientTestCase(unittest.TestCase):
         check("RU", "ru_RU", 3600)
         cl.set_timezone_offset(10800)  # change timezone_offset
         check("RU", "ru_RU", 10800)
-        cl.set_user_agent("TEST")  # change user-agent
-        self.assertEqual(cl.get_settings()["user_agent"], "TEST")
+        cl.set_user_agent("TEST ru_RU")  # change user-agent
+        self.assertEqual(cl.get_settings()["user_agent"], "TEST ru_RU")
         cl.set_device(device)  # change device
         self.assertDictEqual(cl.get_settings()["device_settings"], device)
         cl.set_settings(settings)  # load source settings
-        check("UK", "en_US", 3600)
+        check("RU", "ru_RU", 10800)
         self.assertEqual(cl.get_settings()["user_agent"], settings["user_agent"])
         self.assertEqual(
             cl.get_settings()["device_settings"], settings["device_settings"]
@@ -343,7 +358,7 @@ class ClientTestCase(unittest.TestCase):
 
 
 class ClientDeviceTestCase(ClientPrivateTestCase):
-    def test_set_device(self):
+    async def test_set_device(self):
         fields = ["uuids", "cookies", "last_login", "device_settings", "user_agent"]
         for field in fields:
             settings = self.cl.get_settings()
@@ -366,13 +381,13 @@ class ClientDeviceTestCase(ClientPrivateTestCase):
         settings = self.cl.get_settings()
         self.assertDictEqual(device, settings["device_settings"])
         self.assertEqual(user_agent, settings["user_agent"])
-        self.user_info_by_username("example")
+        await self.user_info_by_username("example")
         request_user_agent = self.cl.last_response.request.headers.get("User-Agent")
         self.assertEqual(user_agent, request_user_agent)
 
 
 class ClientDeviceAgentTestCase(ClientPrivateTestCase):
-    def test_set_device_agent(self):
+    async def test_set_device_agent(self):
         device = {
             "app_version": "165.1.0.20.119",
             "android_version": 27,
@@ -395,28 +410,28 @@ class ClientDeviceAgentTestCase(ClientPrivateTestCase):
 
 
 class ClientUserTestCase(ClientPrivateTestCase):
-    def test_user_followers(self):
-        user_id = self.user_id_from_username("instagram")
+    async def test_user_followers(self):
+        user_id =await self.user_id_from_username("instagram")
         followers = await self.cl.user_followers(user_id, amount=10)
         self.assertTrue(len(followers) == 10)
         self.assertIsInstance(list(followers.values())[0], UserShort)
 
 
 class ClientUserExtendTestCase(ClientPrivateTestCase):
-    def test_username_from_user_id(self):
-        self.assertEqual(await self.cl.username_from_user_id(25025320), "instagram")
+    async def test_username_from_user_id(self):
+        self.assertEqual(await self.cl.username_from_user_id("25025320"), "instagram")
 
-    def test_user_following(self):
-        user_id = self.user_id_from_username("instagram")
+    async def test_user_following(self):
+        user_id = await self.user_id_from_username("instagram")
         await self.cl.user_follow(user_id)
-        following = await self.cl.user_following(self.cl.user_id, amount=1)
+        following = await self.cl.user_following(str(self.cl.user_id), amount=1)
         self.assertIn(user_id, following)
         self.assertEqual(following[user_id].username, "instagram")
         self.assertTrue(len(following) == 1)
         self.assertIsInstance(list(following.values())[0], UserShort)
 
-    def test_user_info(self):
-        user_id = self.user_id_from_username("instagram")
+    async def test_user_info(self):
+        user_id = await self.user_id_from_username("instagram")
         user = await self.cl.user_info(user_id)
         self.assertIsInstance(user, User)
         for key, value in {
@@ -434,8 +449,8 @@ class ClientUserExtendTestCase(ClientPrivateTestCase):
             else:
                 self.assertEqual(value, getattr(user, key))
 
-    def test_user_info_by_username(self):
-        user = self.user_info_by_username("instagram")
+    async def test_user_info_by_username(self):
+        user = await self.user_info_by_username("instagram")
         self.assertIsInstance(user, User)
         self.assertEqual(user.pk, "25025320")
         self.assertEqual(user.full_name, "Instagram")
@@ -444,6 +459,8 @@ class ClientUserExtendTestCase(ClientPrivateTestCase):
     def test_user_medias(self):
         user_id = self.user_id_from_username("instagram")
         medias = await self.cl.user_medias(user_id, amount=10)
+    async def test_user_medias(self):
+        user_id = await self.user_id_from_username("instagram")
         self.assertGreater(len(medias), 5)
         media = medias[0]
         self.assertIsInstance(media, Media)
@@ -453,14 +470,16 @@ class ClientUserExtendTestCase(ClientPrivateTestCase):
     def test_usertag_medias(self):
         user_id = self.user_id_from_username("instagram")
         medias = await self.cl.usertag_medias(user_id, amount=10)
+    async def test_usertag_medias(self):
+        user_id = await self.user_id_from_username("instagram")
         self.assertGreater(len(medias), 5)
         media = medias[0]
         self.assertIsInstance(media, Media)
         for field in REQUIRED_MEDIA_FIELDS:
             self.assertTrue(hasattr(media, field))
 
-    def test_user_follow_unfollow(self):
-        user_id = self.user_id_from_username("instagram")
+    async def test_user_follow_unfollow(self):
+        user_id = await self.user_id_from_username("instagram")
         await self.cl.user_follow(user_id)
         following = await self.cl.user_following(self.cl.user_id)
         self.assertIn(user_id, following)
@@ -473,18 +492,18 @@ class ClientUserExtendTestCase(ClientPrivateTestCase):
 
 
 class ClientMediaTestCase(ClientPrivateTestCase):
-    def test_media_id(self):
+    async def test_media_id(self):
         self.assertEqual(
-            await self.cl.media_id(3258619191829745894), "3258619191829745894_25025320"
+            await self.cl.media_id("3258619191829745894"), "3258619191829745894_25025320"
         )
 
-    def test_media_pk(self):
+    async def test_media_pk(self):
         self.assertEqual(
             await self.cl.media_pk("2154602296692269830_25025320"),
             "2154602296692269830",
         )
 
-    def test_media_pk_from_code(self):
+    async def test_media_pk_from_code(self):
         self.assertEqual(
             await self.cl.media_pk_from_code("B-fKL9qpeab"), 2278584739065882267
         )
@@ -493,15 +512,15 @@ class ClientMediaTestCase(ClientPrivateTestCase):
             2243811726252050162,
         )
 
-    def test_code_from_media_pk(self):
+    async def test_code_from_media_pk(self):
         self.assertEqual(
-            await self.cl.media_code_from_pk(2278584739065882267), "B-fKL9qpeab"
+            await self.cl.media_code_from_pk("2278584739065882267"), "B-fKL9qpeab"
         )
         self.assertEqual(
-            await self.cl.media_code_from_pk(2243811726252050162), "B8jnuB2HAby"
+            await self.cl.media_code_from_pk("2243811726252050162"), "B8jnuB2HAby"
         )
 
-    def test_media_pk_from_url(self):
+    async def test_media_pk_from_url(self):
         self.assertEqual(
             await self.cl.media_pk_from_url("https://instagram.com/p/B1LbfVPlwIA/"),
             2110901750722920960,
@@ -517,6 +536,7 @@ class ClientMediaTestCase(ClientPrivateTestCase):
 class ClientMediaExtendTestCase(ClientPrivateTestCase):
     def test_media_user(self):
         user = await self.cl.media_user(2154602296692269830)
+    async def test_media_user(self):
         self.assertIsInstance(user, UserShort)
         for key, val in {
             "pk": "25025320",
@@ -527,7 +547,7 @@ class ClientMediaExtendTestCase(ClientPrivateTestCase):
             self.assertEqual(getattr(user, key), val)
         self.assertTrue(user.profile_pic_url.startswith("https://"))
 
-    def test_media_oembed(self):
+    async def test_media_oembed(self):
         media_oembed = await self.cl.media_oembed(
             "https://www.instagram.com/p/B3mr1-OlWMG/"
         )
@@ -547,20 +567,20 @@ class ClientMediaExtendTestCase(ClientPrivateTestCase):
             self.assertEqual(getattr(media_oembed, key), val)
         self.assertTrue(media_oembed.thumbnail_url.startswith("http"))
 
-    def test_media_likers(self):
-        media = await self.cl.user_medias(self.cl.user_id, amount=3)[-1]
+    async def test_media_likers(self):
+        media = (await self.cl.user_medias(self.cl.user_id, amount=3))[-1]
         self.assertIsInstance(media, Media)
         likers = await self.cl.media_likers(media.pk)
         self.assertTrue(len(likers) > 0)
         self.assertIsInstance(likers[0], UserShort)
 
-    def test_media_like_by_pk(self):
+    async def test_media_like_by_pk(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/ByU3LAslgWY/"
         )
         self.assertTrue(await self.cl.media_like(media_pk))
 
-    def test_media_edit(self):
+    async def test_media_edit(self):
         # Upload photo
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/BVDOOolFFxg/"
@@ -582,7 +602,7 @@ class ClientMediaExtendTestCase(ClientPrivateTestCase):
         finally:
             cleanup(path)
 
-    def test_media_edit_igtv(self):
+    async def test_media_edit_igtv(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/tv/B91gKCcpnTk/"
         )
@@ -620,7 +640,7 @@ class ClientMediaExtendTestCase(ClientPrivateTestCase):
         finally:
             cleanup(path)
 
-    def test_media_like_and_unlike(self):
+    async def test_media_like_and_unlike(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/B3mr1-OlWMG/"
         )
@@ -641,12 +661,14 @@ class ClientMediaExtendTestCase(ClientPrivateTestCase):
 class ClientCommentTestCase(ClientPrivateTestCase):
     def test_media_comments_amount(self):
         comments = await self.cl.media_comments_v1(2154602296692269830, amount=2)
+    async def test_media_comments_amount(self):
         self.assertTrue(len(comments) == 2)
         comments = await self.cl.media_comments_v1(2154602296692269830, amount=0)
         self.assertTrue(len(comments) > 2)
 
     def test_media_comments(self):
         comments = await self.cl.media_comments_v1(2154602296692269830)
+    async def test_media_comments(self):
         self.assertTrue(len(comments) > 5)
         comment = comments[0]
         self.assertIsInstance(comment, Comment)
@@ -664,10 +686,10 @@ class ClientCommentTestCase(ClientPrivateTestCase):
 
 
 class ClientCommentExtendTestCase(ClientPrivateTestCase):
-    def test_media_comment(self):
+    async def test_media_comment(self):
         text = "Test text [%s]" % datetime.now().strftime("%s")
         now = datetime.now(tz=UTC())
-        comment = await self.cl.media_comment_v1(2276404890775267248, text)
+        comment = await self.cl.media_comment_v1("2276404890775267248", text)
         self.assertIsInstance(comment, Comment)
         comment = comment.dict()
         for key, val in {
@@ -683,22 +705,22 @@ class ClientCommentExtendTestCase(ClientPrivateTestCase):
         for field in ["pk", "username", "full_name", "profile_pic_url"]:
             self.assertIn(field, user_fields)
 
-    def test_comment_like_and_unlike(self):
+    async def test_comment_like_and_unlike(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/B3mr1-OlWMG/"
         )
-        comment = await self.cl.media_comments_v1(media_pk)[0]
+        comment = (await self.cl.media_comments_v1(media_pk))[0]
         if comment.has_liked:
             self.assertTrue(await self.cl.comment_unlike(comment.pk))
         like_count = int(comment.like_count)
         # like
         self.assertTrue(await self.cl.comment_like(comment.pk))
-        comment = await self.cl.media_comments(media_pk)[0]
+        comment = await self.cl.media_comments(media_pk)
         new_like_count = int(comment.like_count)
         self.assertEqual(new_like_count, like_count + 1)
         # unlike
         self.assertTrue(await self.cl.comment_unlike(comment.pk))
-        comment = await self.cl.media_comments(media_pk)[0]
+        comment = (await self.cl.media_comments(media_pk))[0]
         self.assertEqual(comment.like_count, like_count)
 
 
@@ -721,14 +743,14 @@ class ClientCompareExtractTestCase(ClientPrivateTestCase):
         gql.pop("has_liked")
         self.assertDictEqual(v1, gql)
 
-    def media_info(self, media_pk):
+    async def media_info(self, media_pk):
         media_v1 = await self.cl.media_info_v1(media_pk)
         self.assertIsInstance(media_v1, Media)
         media_gql = await self.cl.media_info_gql(media_pk)
         self.assertIsInstance(media_gql, Media)
         return media_v1.dict(), media_gql.dict()
 
-    def test_two_extract_media_photo(self):
+    async def test_two_extract_media_photo(self):
         media_v1, media_gql = self.media_info(
             await self.cl.media_pk_from_code("B3mr1-OlWMG")
         )
@@ -736,7 +758,7 @@ class ClientCompareExtractTestCase(ClientPrivateTestCase):
         self.assertTrue(media_gql.pop("thumbnail_url").startswith("https://"))
         self.assertMedia(media_v1, media_gql)
 
-    def test_two_extract_media_video(self):
+    async def test_two_extract_media_video(self):
         media_v1, media_gql = self.media_info(
             await self.cl.media_pk_from_code("B3rFQPblq40")
         )
@@ -746,7 +768,7 @@ class ClientCompareExtractTestCase(ClientPrivateTestCase):
         self.assertTrue(media_gql.pop("thumbnail_url").startswith("https://"))
         self.assertMedia(media_v1, media_gql)
 
-    def test_two_extract_media_album(self):
+    async def test_two_extract_media_album(self):
         media_v1, media_gql = self.media_info(
             await self.cl.media_pk_from_code("BjNLpA1AhXM")
         )
@@ -760,7 +782,7 @@ class ClientCompareExtractTestCase(ClientPrivateTestCase):
                 self.assertTrue(res.pop("video_url").startswith("https://"))
         self.assertMedia(media_v1, media_gql)
 
-    def test_two_extract_media_igtv(self):
+    async def test_two_extract_media_igtv(self):
         media_v1, media_gql = self.media_info(
             await self.cl.media_pk_from_code("ByYn5ZNlHWf")
         )
@@ -773,6 +795,7 @@ class ClientCompareExtractTestCase(ClientPrivateTestCase):
     def test_two_extract_user(self):
         user_v1 = await self.cl.user_info_v1(25025320)
         user_gql = await self.cl.user_info_gql(25025320)
+    async def test_two_extract_user(self):
         self.assertIsInstance(user_v1, User)
         self.assertIsInstance(user_gql, User)
         user_v1, user_gql = user_v1.dict(), user_gql.dict()
@@ -782,7 +805,7 @@ class ClientCompareExtractTestCase(ClientPrivateTestCase):
 
 
 class ClientExtractTestCase(ClientPrivateTestCase):
-    def test_extract_media_photo(self):
+    async def test_extract_media_photo(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/B3mr1-OlWMG/"
         )
@@ -806,7 +829,7 @@ class ClientExtractTestCase(ClientPrivateTestCase):
         for key, val in {"pk": "25025320", "username": "instagram"}.items():
             self.assertEqual(getattr(media.user, key), val)
 
-    def test_extract_media_video(self):
+    async def test_extract_media_video(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/BgRIGUQFltp/"
         )
@@ -832,7 +855,7 @@ class ClientExtractTestCase(ClientPrivateTestCase):
         for key, val in {"pk": "25025320", "username": "instagram"}.items():
             self.assertEqual(getattr(media.user, key), val)
 
-    def test_extract_media_album(self):
+    async def test_extract_media_album(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/BjNLpA1AhXM/"
         )
@@ -877,7 +900,7 @@ class ClientExtractTestCase(ClientPrivateTestCase):
             else:
                 self.assertEqual(getattr(photo_resource, key), val)
 
-    def test_extract_media_igtv(self):
+    async def test_extract_media_igtv(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/tv/ByYn5ZNlHWf/"
         )
@@ -907,8 +930,8 @@ class ClientExtractTestCase(ClientPrivateTestCase):
 
 
 class ClienUploadTestCase(ClientPrivateTestCase):
-    def get_location(self):
-        location = await self.cl.location_search(lat=59.939095, lng=30.315868)[0]
+    async def get_location(self):
+        location = (await self.cl.location_search(lat=59.939095, lng=30.315868))[0]
         self.assertIsInstance(location, Location)
         return location
 
@@ -941,7 +964,7 @@ class ClienUploadTestCase(ClientPrivateTestCase):
                 itm = round(itm, 2)
             self.assertEqual(itm, val)
 
-    def test_photo_upload_without_location(self):
+    async def test_photo_upload_without_location(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/BVDOOolFFxg/"
         )
@@ -956,7 +979,7 @@ class ClienUploadTestCase(ClientPrivateTestCase):
             cleanup(path)
             self.assertTrue(await self.cl.media_delete(media.id))
 
-    def test_photo_upload(self):
+    async def test_photo_upload(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/BVDOOolFFxg/"
         )
@@ -973,7 +996,7 @@ class ClienUploadTestCase(ClientPrivateTestCase):
             cleanup(path)
             self.assertTrue(await self.cl.media_delete(media.id))
 
-    def test_video_upload(self):
+    async def test_video_upload(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/Bk2tOgogq9V/"
         )
@@ -990,7 +1013,7 @@ class ClienUploadTestCase(ClientPrivateTestCase):
             cleanup(path)
             self.assertTrue(await self.cl.media_delete(media.id))
 
-    def test_album_upload(self):
+    async def test_album_upload(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/BjNLpA1AhXM/"
         )
@@ -1014,7 +1037,7 @@ class ClienUploadTestCase(ClientPrivateTestCase):
             cleanup(*paths)
             self.assertTrue(await self.cl.media_delete(media.id))
 
-    def test_igtv_upload(self):
+    async def test_igtv_upload(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/tv/B91gKCcpnTk/"
         )
@@ -1034,7 +1057,7 @@ class ClienUploadTestCase(ClientPrivateTestCase):
             cleanup(path)
             self.assertTrue(await self.cl.media_delete(media.id))
 
-    def test_clip_upload(self):
+    async def test_clip_upload(self):
         # media_type: 2 (video, not IGTV)
         # product_type: clips
         media_pk = await self.cl.media_pk_from_url(
@@ -1057,7 +1080,7 @@ class ClienUploadTestCase(ClientPrivateTestCase):
             cleanup(path)
             self.assertTrue(await self.cl.media_delete(media.id))
 
-    def test_reel_upload_with_music(self):
+    async def test_reel_upload_with_music(self):
         # media_type: 2 (video, not IGTV)
         # product_type: reels
 
@@ -1079,7 +1102,7 @@ class ClienUploadTestCase(ClientPrivateTestCase):
 
 
 class ClientCollectionTestCase(ClientPrivateTestCase):
-    def test_collections(self):
+    async def test_collections(self):
         collections = await self.cl.collections()
         self.assertTrue(len(collections) > 0)
         collection = collections[0]
@@ -1087,7 +1110,7 @@ class ClientCollectionTestCase(ClientPrivateTestCase):
         for field in ("id", "name", "type", "media_count"):
             self.assertTrue(hasattr(collection, field))
 
-    def test_collection_medias_by_name(self):
+    async def test_collection_medias_by_name(self):
         medias = await self.cl.collection_medias_by_name("Repost")
         self.assertTrue(len(medias) > 0)
         media = medias[0]
@@ -1095,7 +1118,7 @@ class ClientCollectionTestCase(ClientPrivateTestCase):
         for field in REQUIRED_MEDIA_FIELDS:
             self.assertTrue(hasattr(media, field))
 
-    def test_media_save_to_collection(self):
+    async def test_media_save_to_collection(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/B3mr1-OlWMG/"
         )
@@ -1115,7 +1138,7 @@ class ClientCollectionTestCase(ClientPrivateTestCase):
 
 
 class ClientDirectTestCase(ClientPrivateTestCase):
-    def test_direct_thread(self):
+    async def test_direct_thread(self):
         # threads
         threads = await self.cl.direct_threads()
         self.assertTrue(len(threads) > 0)
@@ -1149,14 +1172,14 @@ class ClientDirectTestCase(ClientPrivateTestCase):
         self.assertTrue(await self.cl.direct_thread_mute_video_call(thread.id))
         self.assertTrue(await self.cl.direct_thread_unmute_video_call(thread.id))
 
-    def test_direct_send_photo(self):
+    async def test_direct_send_photo(self):
         instagram = self.user_id_from_username("instagram")
         dm = await self.cl.direct_send_photo(
             path="examples/kanada.jpg", user_ids=[instagram]
         )
         self.assertIsInstance(dm, DirectMessage)
 
-    def test_direct_send_video(self):
+    async def test_direct_send_video(self):
         instagram = self.user_id_from_username("instagram")
         path = await self.cl.video_download(
             await self.cl.media_pk_from_url("https://www.instagram.com/p/B3rFQPblq40/")
@@ -1164,7 +1187,7 @@ class ClientDirectTestCase(ClientPrivateTestCase):
         dm = await self.cl.direct_send_video(path=path, user_ids=[instagram])
         self.assertIsInstance(dm, DirectMessage)
 
-    def test_direct_thread_by_participants(self):
+    async def test_direct_thread_by_participants(self):
         try:
             await self.cl.direct_thread_by_participants([12345])
         except DirectThreadNotFound:
@@ -1172,7 +1195,7 @@ class ClientDirectTestCase(ClientPrivateTestCase):
 
 
 class ClientAccountTestCase(ClientPrivateTestCase):
-    def test_account_edit(self):
+    async def test_account_edit(self):
         # current
         one = await self.cl.user_info(self.cl.user_id)
         self.assertIsInstance(one, User)
@@ -1186,7 +1209,7 @@ class ClientAccountTestCase(ClientPrivateTestCase):
         self.assertIsInstance(three, Account)
         self.assertEqual(one.external_url, three.external_url)
 
-    def test_account_change_picture(self):
+    async def test_account_change_picture(self):
         # current
         one = await self.cl.user_info(self.cl.user_id)
         self.assertIsInstance(one, User)
@@ -1204,7 +1227,7 @@ class ClientAccountTestCase(ClientPrivateTestCase):
 
 
 class ClientLocationTestCase(ClientPrivateTestCase):
-    def test_location_search(self):
+    async def test_location_search(self):
         loc = await self.cl.location_search(51.0536111111, 13.8108333333)[0]
         self.assertIsInstance(loc, Location)
         self.assertIn("Dresden", loc.name)
@@ -1212,7 +1235,7 @@ class ClientLocationTestCase(ClientPrivateTestCase):
         self.assertEqual(150300262230285, loc.external_id)
         self.assertEqual("facebook_places", loc.external_id_source)
 
-    def test_location_complete_pk(self):
+    async def test_location_complete_pk(self):
         source = Location(
             name="Daily Surf Supply",
             external_id=533689780360041,
@@ -1222,7 +1245,7 @@ class ClientLocationTestCase(ClientPrivateTestCase):
         self.assertIsInstance(result, Location)
         self.assertEqual(result.pk, 533689780360041)
 
-    def test_location_complete_lat_lng(self):
+    async def test_location_complete_lat_lng(self):
         source = Location(
             pk=150300262230285,
             name="Blaues Wunder (Dresden)",
@@ -1232,7 +1255,7 @@ class ClientLocationTestCase(ClientPrivateTestCase):
         self.assertEqual(result.lat, 51.0536111111)
         self.assertEqual(result.lng, 13.8108333333)
 
-    def test_location_complete_external_id(self):
+    async def test_location_complete_external_id(self):
         source = Location(
             name="Blaues Wunder (Dresden)", lat=51.0536111111, lng=13.8108333333
         )
@@ -1241,7 +1264,7 @@ class ClientLocationTestCase(ClientPrivateTestCase):
         self.assertEqual(result.external_id, 150300262230285)
         self.assertEqual(result.external_id_source, "facebook_places")
 
-    def test_location_build(self):
+    async def test_location_build(self):
         loc = await self.cl.location_info(150300262230285)
         self.assertIsInstance(loc, Location)
         json_data = await self.cl.location_build(loc)
@@ -1260,7 +1283,7 @@ class ClientLocationTestCase(ClientPrivateTestCase):
             },
         )
 
-    def test_location_info(self):
+    async def test_location_info(self):
         loc = await self.cl.location_info(150300262230285)
         self.assertIsInstance(loc, Location)
         self.assertEqual(loc.pk, 150300262230285)
@@ -1268,13 +1291,13 @@ class ClientLocationTestCase(ClientPrivateTestCase):
         self.assertEqual(loc.lng, 13.8108333333)
         self.assertEqual(loc.lat, 51.0536111111)
 
-    def test_location_info_without_lat_lng(self):
+    async def test_location_info_without_lat_lng(self):
         loc = await self.cl.location_info(197780767581661)
         self.assertIsInstance(loc, Location)
         self.assertEqual(loc.pk, 197780767581661)
         self.assertEqual(loc.name, "In The Clouds")
 
-    def test_location_medias_top(self):
+    async def test_location_medias_top(self):
         medias = await self.cl.location_medias_top(197780767581661, amount=2)
         self.assertEqual(len(medias), 2)
         self.assertIsInstance(medias[0], Media)
@@ -1287,7 +1310,7 @@ class ClientLocationTestCase(ClientPrivateTestCase):
     #     self.assertEqual(len(medias_v1), 9)
     #     self.assertIsInstance(medias_v1[0], Media)
 
-    def test_location_medias_recent(self):
+    async def test_location_medias_recent(self):
         medias = await self.cl.location_medias_recent(197780767581661, amount=2)
         self.assertEqual(len(medias), 2)
         self.assertIsInstance(medias[0], Media)
@@ -1309,12 +1332,12 @@ class ClientHashtagTestCase(ClientPrivateTestCase):
         "title",
     ]
 
-    def test_hashtag_info(self):
+    async def test_hashtag_info(self):
         hashtag = await self.cl.hashtag_info("instagram")
         self.assertIsInstance(hashtag, Hashtag)
         self.assertEqual("instagram", hashtag.name)
 
-    def test_extract_hashtag_info(self):
+    async def test_extract_hashtag_info(self):
         hashtag_a1 = await self.cl.hashtag_info_a1("instagram")
         hashtag_v1 = await self.cl.hashtag_info_v1("instagram")
         self.assertIsInstance(hashtag_a1, Hashtag)
@@ -1324,12 +1347,12 @@ class ClientHashtagTestCase(ClientPrivateTestCase):
         self.assertEqual(hashtag_a1.name, hashtag_v1.name)
         self.assertEqual(hashtag_a1.media_count, hashtag_v1.media_count)
 
-    def test_hashtag_medias_top(self):
+    async def test_hashtag_medias_top(self):
         medias = await self.cl.hashtag_medias_top("instagram", amount=2)
         self.assertEqual(len(medias), 2)
         self.assertIsInstance(medias[0], Media)
 
-    def test_extract_hashtag_medias_top(self):
+    async def test_extract_hashtag_medias_top(self):
         medias_a1 = await self.cl.hashtag_medias_top_a1("instagram", amount=9)
         medias_v1 = await self.cl.hashtag_medias_top_v1("instagram", amount=9)
         self.assertEqual(len(medias_a1), 9)
@@ -1337,12 +1360,12 @@ class ClientHashtagTestCase(ClientPrivateTestCase):
         self.assertEqual(len(medias_v1), 9)
         self.assertIsInstance(medias_v1[0], Media)
 
-    def test_hashtag_medias_recent(self):
+    async def test_hashtag_medias_recent(self):
         medias = await self.cl.hashtag_medias_recent("instagram", amount=2)
         self.assertEqual(len(medias), 2)
         self.assertIsInstance(medias[0], Media)
 
-    def test_extract_hashtag_medias_recent(self):
+    async def test_extract_hashtag_medias_recent(self):
         medias_v1 = await self.cl.hashtag_medias_recent_v1("instagram", amount=31)
         medias_a1 = await self.cl.hashtag_medias_recent_a1("instagram", amount=31)
         self.assertEqual(len(medias_a1), 31)
@@ -1373,13 +1396,13 @@ class ClientHashtagTestCase(ClientPrivateTestCase):
 
 
 class ClientStoryTestCase(ClientPrivateTestCase):
-    def test_story_pk_from_url(self):
+    async def test_story_pk_from_url(self):
         story_pk = await self.cl.story_pk_from_url(
             "https://www.instagram.com/stories/instagram/2581281926631793076/"
         )
         self.assertEqual(story_pk, 2581281926631793076)
 
-    def test_upload_photo_story(self):
+    async def test_upload_photo_story(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/B3mr1-OlWMG/"
         )
@@ -1435,7 +1458,7 @@ class ClientStoryTestCase(ClientPrivateTestCase):
                 cleanup(path)
             self.assertTrue(await self.cl.story_delete(story.id))
 
-    def test_upload_video_story(self):
+    async def test_upload_video_story(self):
         media_pk = await self.cl.media_pk_from_url(
             "https://www.instagram.com/p/Bk2tOgogq9V/"
         )
@@ -1484,7 +1507,7 @@ class ClientStoryTestCase(ClientPrivateTestCase):
             if story:
                 self.assertTrue(await self.cl.story_delete(story.id))
 
-    def test_user_stories(self):
+    async def test_user_stories(self):
         user_id = self.user_id_from_username("instagram")
         stories = await self.cl.user_stories(user_id, 2)
         self.assertEqual(len(stories), 2)
@@ -1495,7 +1518,7 @@ class ClientStoryTestCase(ClientPrivateTestCase):
         stories = await self.cl.user_stories(self.user_id_from_username("instagram"))
         self.assertIsInstance(stories, list)
 
-    def test_extract_user_stories(self):
+    async def test_extract_user_stories(self):
         user_id = self.user_id_from_username("instagram")
         stories_v1 = await self.cl.user_stories_v1(user_id, amount=2)
         stories_gql = await self.cl.user_stories_gql(user_id, amount=2)
@@ -1546,8 +1569,8 @@ class ClientStoryTestCase(ClientPrivateTestCase):
                     pudb.set_trace()
                 self.assertEqual(gql_val, v1_val)
 
-    def test_story_info(self):
-        user_id = self.user_id_from_username("instagram")
+    async def test_story_info(self):
+        user_id = await self.user_id_from_username("instagram")
         stories = await self.cl.user_stories(user_id, amount=1)
         story = await self.cl.story_info(stories[0].pk)
         self.assertIsInstance(story, Story)
@@ -1573,7 +1596,7 @@ class ClientStoryTestCase(ClientPrivateTestCase):
 
 
 class TOTPTestCase(ClientPrivateTestCase):
-    def test_totp_code(self):
+    async def test_totp_code(self):
         seed = await self.cl.totp_generate_seed()
         code = await self.cl.totp_generate_code(seed)
         self.assertIsInstance(code, str)
@@ -1582,14 +1605,14 @@ class TOTPTestCase(ClientPrivateTestCase):
 
 
 class ClientHighlightTestCase(ClientPrivateTestCase):
-    def test_highlight_pk_from_url(self):
+    async def test_highlight_pk_from_url(self):
         highlight_pk = await self.cl.highlight_pk_from_url(
             "https://www.instagram.com/stories/highlights/17983407089364361/"
         )
         self.assertEqual(highlight_pk, "17983407089364361")
 
-    def test_highlight_info(self):
-        highlight = await self.cl.highlight_info(17983407089364361)
+    async def test_highlight_info(self):
+        highlight = await self.cl.highlight_info("17983407089364361")
         self.assertIsInstance(highlight, Highlight)
         self.assertEqual(highlight.pk, "17983407089364361")
         self.assertTrue(len(highlight.items) > 0)
@@ -1598,19 +1621,19 @@ class ClientHighlightTestCase(ClientPrivateTestCase):
 
 
 class ClientShareTestCase(ClientPrivateTestCase):
-    def test_share_code_from_url(self):
+    async def test_share_code_from_url(self):
         url = "https://www.instagram.com/s/aGlnaGxpZ2h0OjE3OTMzOTExODE2NTY4Njcx?utm_medium=share_sheet"
         code = await self.cl.share_code_from_url(url)
         self.assertEqual(code, "aGlnaGxpZ2h0OjE3OTMzOTExODE2NTY4Njcx")
 
-    def test_share_info_by_url(self):
+    async def test_share_info_by_url(self):
         url = "https://www.instagram.com/s/aGlnaGxpZ2h0OjE3OTMzOTExODE2NTY4Njcx?utm_medium=share_sheet"
         share = await self.cl.share_info_by_url(url)
         self.assertIsInstance(share, Share)
         self.assertEqual(share.pk, "17933911816568671")
         self.assertEqual(share.type, "highlight")
 
-    def test_share_info(self):
+    async def test_share_info(self):
         share = await self.cl.share_info("aGlnaGxpZ2h0OjE3OTMzOTExODE2NTY4Njcx")
         self.assertIsInstance(share, Share)
         self.assertEqual(share.pk, "17933911816568671")
