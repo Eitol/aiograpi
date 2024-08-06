@@ -13,10 +13,7 @@ from pathlib import Path
 
 from aiograpi import Client
 from aiograpi.exceptions import (
-    BadCredentials,
     DirectThreadNotFound,
-    ProxyAddressIsBlocked,
-    BadPassword,
 )
 from aiograpi.story import StoryBuilder
 from aiograpi.types import (
@@ -456,22 +453,18 @@ class ClientUserExtendTestCase(ClientPrivateTestCase):
         self.assertEqual(user.full_name, "Instagram")
         self.assertFalse(user.is_private)
 
-    def test_user_medias(self):
-        user_id = self.user_id_from_username("instagram")
-        medias = await self.cl.user_medias(user_id, amount=10)
     async def test_user_medias(self):
         user_id = await self.user_id_from_username("instagram")
+        medias = await self.cl.user_medias(int(user_id), amount=10)
         self.assertGreater(len(medias), 5)
         media = medias[0]
         self.assertIsInstance(media, Media)
         for field in REQUIRED_MEDIA_FIELDS:
             self.assertTrue(hasattr(media, field))
 
-    def test_usertag_medias(self):
-        user_id = self.user_id_from_username("instagram")
-        medias = await self.cl.usertag_medias(user_id, amount=10)
     async def test_usertag_medias(self):
         user_id = await self.user_id_from_username("instagram")
+        medias = await self.cl.usertag_medias(int(user_id), amount=10)
         self.assertGreater(len(medias), 5)
         media = medias[0]
         self.assertIsInstance(media, Media)
@@ -481,10 +474,10 @@ class ClientUserExtendTestCase(ClientPrivateTestCase):
     async def test_user_follow_unfollow(self):
         user_id = await self.user_id_from_username("instagram")
         await self.cl.user_follow(user_id)
-        following = await self.cl.user_following(self.cl.user_id)
+        following = await self.cl.user_following(str(self.cl.user_id))
         self.assertIn(user_id, following)
         await self.cl.user_unfollow(user_id)
-        following = await self.cl.user_following(self.cl.user_id)
+        following = await self.cl.user_following(str(self.cl.user_id))
         self.assertNotIn(user_id, following)
 
     # def test_send_new_note(self):
@@ -534,9 +527,8 @@ class ClientMediaTestCase(ClientPrivateTestCase):
 
 
 class ClientMediaExtendTestCase(ClientPrivateTestCase):
-    def test_media_user(self):
-        user = await self.cl.media_user(2154602296692269830)
     async def test_media_user(self):
+        user = await self.cl.media_user("2154602296692269830")
         self.assertIsInstance(user, UserShort)
         for key, val in {
             "pk": "25025320",
@@ -659,16 +651,14 @@ class ClientMediaExtendTestCase(ClientPrivateTestCase):
 
 
 class ClientCommentTestCase(ClientPrivateTestCase):
-    def test_media_comments_amount(self):
-        comments = await self.cl.media_comments_v1(2154602296692269830, amount=2)
     async def test_media_comments_amount(self):
+        comments = await self.cl.media_comments_v1("2154602296692269830", amount=2)
         self.assertTrue(len(comments) == 2)
-        comments = await self.cl.media_comments_v1(2154602296692269830, amount=0)
+        comments = await self.cl.media_comments_v1("2154602296692269830", amount=0)
         self.assertTrue(len(comments) > 2)
 
-    def test_media_comments(self):
-        comments = await self.cl.media_comments_v1(2154602296692269830)
     async def test_media_comments(self):
+        comments = await self.cl.media_comments_v1("2154602296692269830")
         self.assertTrue(len(comments) > 5)
         comment = comments[0]
         self.assertIsInstance(comment, Comment)
@@ -792,10 +782,9 @@ class ClientCompareExtractTestCase(ClientPrivateTestCase):
         self.assertTrue(media_gql.pop("thumbnail_url").startswith("https://"))
         self.assertMedia(media_v1, media_gql)
 
-    def test_two_extract_user(self):
-        user_v1 = await self.cl.user_info_v1(25025320)
-        user_gql = await self.cl.user_info_gql(25025320)
     async def test_two_extract_user(self):
+        user_v1 = await self.cl.user_info_v1("25025320")
+        user_gql = await self.cl.user_info_gql("25025320")
         self.assertIsInstance(user_v1, User)
         self.assertIsInstance(user_gql, User)
         user_v1, user_gql = user_v1.dict(), user_gql.dict()
@@ -954,6 +943,7 @@ class ClienUploadTestCase(ClientPrivateTestCase):
                 external_id_source="facebook_places",
             ),
         ]
+        data = None
         for data in locations:
             if data["pk"] == location.pk:
                 break
